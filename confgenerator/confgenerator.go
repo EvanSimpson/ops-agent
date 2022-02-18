@@ -196,6 +196,14 @@ func (l *Logging) generateFluentbitComponents(userAgent string, hostInfo *host.I
 				tags = append(tags, regexp.QuoteMeta(tag)+regexSuffix)
 				tag = tag + globSuffix
 
+				components = append(components, setLogNameComponents(tag, rID)...)
+
+				// Logs ingested using the fluent_forward receiver must add the existing_tag
+				// on the record to the LogName. This is done with a Lua filter.
+				if receiver.Type() == "fluent_forward" {
+					components = append(components, addLuaFilter(tag, "add_log_name.lua", "add_log_name")...)
+				}
+
 				for i, pID := range p.ProcessorIDs {
 					processor, ok := l.Processors[pID]
 					if !ok {
@@ -205,13 +213,6 @@ func (l *Logging) generateFluentbitComponents(userAgent string, hostInfo *host.I
 						return nil, fmt.Errorf("processor %q not found", pID)
 					}
 					components = append(components, processor.Components(tag, strconv.Itoa(i))...)
-				}
-				components = append(components, setLogNameComponents(tag, rID)...)
-
-				// Logs ingested using the fluent_forward receiver must add the existing_tag
-				// on the record to the LogName. This is done with a Lua filter.
-				if receiver.Type() == "fluent_forward" {
-					components = append(components, addLuaFilter(tag, "add_log_name.lua", "add_log_name")...)
 				}
 				sources = append(sources, fbSource{tag, components})
 			}
