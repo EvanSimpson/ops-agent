@@ -31,6 +31,14 @@ func setLogNameComponents(tag, logName string) []fluentbit.Component {
 				"Name":  "modify",
 			},
 		},
+		{
+			Kind: "FILTER",
+			Config: map[string]string{
+				"Match": tag,
+				"Add":   fmt.Sprintf("TEST_STRING %s", logName),
+				"Name":  "modify",
+			},
+		},
 	}
 }
 

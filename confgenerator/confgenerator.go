@@ -217,7 +217,7 @@ func (l *Logging) generateFluentbitComponents(userAgent string, hostInfo *host.I
 				sources = append(sources, fbSource{tag, components})
 			}
 		}
-		sort.Slice(sources, func(i, j int) bool { return sources[i].tag < sources[j].tag })
+		sort.Slice(sources[:], func(i, j int) bool { return sources[i].tag < sources[j].tag })
 		sort.Strings(tags)
 
 		for _, s := range sources {
