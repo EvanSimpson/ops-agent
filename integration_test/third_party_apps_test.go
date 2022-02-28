@@ -307,12 +307,28 @@ func assertMetric(ctx context.Context, logger *logging.DirectoryLogger, vm *gce.
 }
 
 func assertMetricLabels(expectedLabels []string, series *monitoringpb.TimeSeries) error {
+	// All expected labels must be present
 	for _, expectedLabel := range expectedLabels {
 		if _, ok := series.Metric.Labels[expectedLabel]; !ok {
-			return fmt.Errorf("label not found: %s", expectedLabel)
+			return fmt.Errorf("required label not found by backend: %s", expectedLabel)
+		}
+	}
+	// All present labels must be expected
+	for actualLabel := range series.Metric.Labels {
+		if !containsString(expectedLabels, actualLabel) {
+			return fmt.Errorf("unknown label returned by backend: %s", actualLabel)
 		}
 	}
 	return nil
+}
+
+func containsString(slice []string, contains string) bool {
+	for _, element := range slice {
+		if element == contains {
+			return true
+		}
+	}
+	return false
 }
 
 type testConfig struct {
