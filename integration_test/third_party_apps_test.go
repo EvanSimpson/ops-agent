@@ -46,6 +46,8 @@ import (
 	"github.com/cenkalti/backoff/v4"
 	"go.uber.org/multierr"
 	"gopkg.in/yaml.v2"
+
+	monitoringpb "google.golang.org/genproto/googleapis/monitoring/v3"
 )
 
 var (
@@ -216,6 +218,15 @@ type expectedEntry struct {
 	FieldMatchers map[string]string `yaml:"field_matchers"`
 }
 
+type expectedMetricEntry struct {
+	Type              string   `yaml:"type"`
+	ValueType         string   `yaml:"valuetype"`
+	Kind              string   `yaml:"kind"`
+	MonitoredResource string   `yaml:"monitored_resource"`
+	Labels            []string `yaml:"labels"`
+	Optional          bool     `yaml:"optional,omitempty"`
+}
+
 // constructQuery converts the given map of:
 //   field name => field value regex
 // into a query filter to pass to the logging API.
@@ -249,6 +260,59 @@ func runLoggingTestCases(ctx context.Context, logger *logging.DirectoryLogger, v
 		err = multierr.Append(err, <-c)
 	}
 	return err
+}
+
+func runMetricsTestCases(ctx context.Context, logger *logging.DirectoryLogger, vm *gce.VM, testCaseBytes []byte) error {
+	var entries []expectedMetricEntry
+	var requiredEntries []expectedMetricEntry
+	err := yaml.UnmarshalStrict(testCaseBytes, &entries)
+	if err != nil {
+		return fmt.Errorf("could not unmarshal contents of expected_metrics.yaml: %v", err)
+	}
+	logger.ToMainLog().Printf("Parsed expected_metrics.yaml: %+v", entries)
+	for _, entry := range entries {
+		if entry.Optional {
+			logger.ToMainLog().Printf("Skipping expected metric %s because it is marked optional", entry.Type)
+		} else {
+			requiredEntries = append(requiredEntries, entry)
+		}
+	}
+	c := make(chan error, len(requiredEntries))
+	for _, entry := range requiredEntries {
+		entry := entry
+		go func() {
+			c <- assertMetric(ctx, logger, vm, entry)
+		}()
+	}
+	for range requiredEntries {
+		err = multierr.Append(err, <-c)
+	}
+	return err
+}
+
+func assertMetric(ctx context.Context, logger *logging.DirectoryLogger, vm *gce.VM, metric expectedMetricEntry) error {
+	err, series := gce.WaitForMetric(ctx, logger.ToMainLog(), vm, metric.Type, 1*time.Hour, nil)
+	if err == nil {
+		if series.ValueType.String() != metric.ValueType {
+			err = fmt.Errorf("valueType: expected %s but got %s", metric.ValueType, series.ValueType.String())
+		} else if series.MetricKind.String() != metric.Kind {
+			err = fmt.Errorf("kind: expected %s but got %s", metric.Kind, series.MetricKind.String())
+		} else if series.Resource.Type != metric.MonitoredResource {
+			err = fmt.Errorf("monitored_resource: expected %s but got %s", metric.MonitoredResource, series.Resource.Type)
+		} else {
+			err = assertMetricLabels(metric.Labels, series)
+		}
+	}
+	return err
+}
+
+func assertMetricLabels(expectedLabels []string, series *monitoringpb.TimeSeries) error {
+	for _, expectedLabel := range expectedLabels {
+		if _, ok := series.Metric.Labels[expectedLabel]; !ok {
+			return fmt.Errorf("label not found: %s", expectedLabel)
+		}
+	}
+	return nil
 }
 
 type testConfig struct {
@@ -347,19 +411,15 @@ func runSingleTest(ctx context.Context, logger *logging.DirectoryLogger, vm *gce
 		}
 	}
 
-	metricName, err := findMetricName(app)
-	if err != nil {
-		return nonRetryable, fmt.Errorf("error finding metric name for %v: %v", app, err)
+	// Check if expected_metrics.yaml exists, and run the test cases if it does.
+	testCaseBytes, err = readFileFromScriptsDir(path.Join("applications", app, "expected_metrics.yaml"))
+	if err == nil {
+		logger.ToMainLog().Println("found expected_metrics.yaml, running metrics test cases...")
+		if err = runMetricsTestCases(ctx, logger, vm, testCaseBytes); err != nil {
+			return nonRetryable, err
+		}
 	}
-	if metricName == "" {
-		logger.ToMainLog().Println("metric_name.txt is empty, skipping metrics testing...")
-		return nonRetryable, nil
-	}
-	// Assert that the right metric has been uploaded for the given instance
-	// at least once in the last hour.
-	if err = gce.WaitForMetric(ctx, logger.ToMainLog(), vm, metricName, 1*time.Hour, nil); err != nil {
-		return nonRetryable, err
-	}
+
 	return nonRetryable, nil
 }
 

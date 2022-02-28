@@ -1,0 +1,10 @@
+- type: workload.googleapis.com/apache.current_connections
+  valuetype: INT64
+  kind: GAUGE
+  monitored_resource: gce_instance
+  labels: [server_name]
+- type: workload.googleapis.com/apache.scoreboard
+  valuetype: INT64
+  kind: GAUGE
+  monitored_resource: gce_instance
+  labels: [server_name, state]
