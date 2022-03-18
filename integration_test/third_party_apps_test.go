@@ -7,10 +7,6 @@ For instructions, see the top of gce_testing.go.
 This test needs the following environment variables to be defined, in addition
 to the ones mentioned at the top of gce_testing.go:
 
-SCRIPTS_DIR: a path containing scripts for installing/configuring the various
-    applications and agents. Also has some files that aren't technically
-    scripts that tell the test what to do, such as supported_applications.txt.
-
 PLATFORMS: a comma-separated list of distros to test, e.g. "centos-7,centos-8".
 
 The following variables are optional:
@@ -31,6 +27,7 @@ package integration_test
 
 import (
 	"context"
+	"embed"
 	"fmt"
 	"log"
 	"os"
@@ -49,9 +46,11 @@ import (
 )
 
 var (
-	scriptsDir    = os.Getenv("SCRIPTS_DIR")
 	packagesInGCS = os.Getenv("AGENT_PACKAGES_IN_GCS")
 )
+
+//go:embed third_party_apps_data
+var scriptsDir embed.FS
 
 // removeFromSlice returns a new []string that is a copy of the given []string
 // with all occurrences of toRemove removed.
@@ -74,16 +73,32 @@ func osFolder(platform string) string {
 	return "linux"
 }
 
+// rejectDuplicates looks for duplicate entries in the input slice and returns
+// an error if any is found.
+func rejectDuplicates(apps []string) error {
+	seen := make(map[string]bool)
+	for _, app := range apps {
+		if seen[app] {
+			return fmt.Errorf("application %q appears multiple times in supported_applications.txt", app)
+		}
+		seen[app] = true
+	}
+	return nil
+}
+
 // appsToTest reads which applications to test for the given agent+platform
 // combination from the appropriate supported_applications.txt file.
 func appsToTest(agentType, platform string) ([]string, error) {
-	contents, err := os.ReadFile(
-		path.Join(scriptsDir, "agent", agentType, osFolder(platform), "supported_applications.txt"))
+	contents, err := readFileFromScriptsDir(
+		path.Join("agent", agentType, osFolder(platform), "supported_applications.txt"))
 	if err != nil {
 		return nil, fmt.Errorf("could not read supported_applications.txt: %v", err)
 	}
 
 	apps := strings.Split(strings.TrimSpace(string(contents)), "\n")
+	if err = rejectDuplicates(apps); err != nil {
+		return nil, err
+	}
 	if gce.IsWindows(platform) && !strings.HasPrefix(platform, "sql-") {
 		apps = removeFromSlice(apps, "mssql")
 	}
@@ -94,7 +109,7 @@ func appsToTest(agentType, platform string) ([]string, error) {
 // corresponding to the given application. The file is allowed to be empty,
 // and if so, the test is skipped.
 func findMetricName(app string) (string, error) {
-	contents, err := os.ReadFile(path.Join(scriptsDir, "applications", app, "metric_name.txt"))
+	contents, err := readFileFromScriptsDir(path.Join("applications", app, "metric_name.txt"))
 	if err != nil {
 		return "", fmt.Errorf("could not read metric_name.txt: %v", err)
 	}
@@ -134,7 +149,7 @@ func distroFolder(platform string) (string, error) {
 }
 
 func readFileFromScriptsDir(scriptPath string) ([]byte, error) {
-	return os.ReadFile(path.Join(scriptsDir, scriptPath))
+	return scriptsDir.ReadFile(path.Join("third_party_apps_data", scriptPath))
 }
 
 // runScriptFromScriptsDir runs a script on the given VM.
@@ -272,11 +287,6 @@ func runSingleTest(ctx context.Context, logger *logging.DirectoryLogger, vm *gce
 		return shouldRetry, fmt.Errorf("error installing agent: %v", err)
 	}
 
-	if _, err = runScriptFromScriptsDir(
-		ctx, logger, vm, path.Join("applications", app, folder, "post"), nil); err != nil {
-		return retryable, fmt.Errorf("error starting %s: %v", app, err)
-	}
-
 	if _, err = runScriptFromScriptsDir(ctx, logger, vm, path.Join("applications", app, "enable"), nil); err != nil {
 		return nonRetryable, fmt.Errorf("error enabling %s: %v", app, err)
 	}
@@ -400,10 +410,6 @@ func determineTestsToSkip(tests []test, impactedApps map[string]bool, testConfig
 				tests[i].skipReason = fmt.Sprintf("skipping %v because it's not impacted by pending change", test.app)
 			}
 		}
-		if test.app == "mysql" {
-			// TODO(b/215197805): Reenable this test once the repos are fixed.
-			tests[i].skipReason = "mysql repos seem to be totally broken, see b/215197805"
-		}
 		if sliceContains(testConfig.PerApplicationOverrides[test.app].PlatformsToSkip, test.platform) {
 			tests[i].skipReason = "Skipping test due to 'platforms_to_skip' entry in test_config.yaml"
 		}
@@ -415,9 +421,6 @@ func determineTestsToSkip(tests []test, impactedApps map[string]bool, testConfig
 func TestThirdPartyApps(t *testing.T) {
 	t.Cleanup(gce.CleanupKeysOrDie)
 
-	if scriptsDir == "" {
-		t.Fatalf("Cannot run test with empty value of SCRIPTS_DIR.")
-	}
 	agentType := agents.OpsAgentType
 
 	testConfig, err := parseTestConfigFile()
@@ -445,45 +448,42 @@ func TestThirdPartyApps(t *testing.T) {
 	// Execute tests
 	for _, tc := range tests {
 		tc := tc // https://golang.org/doc/faq#closures_and_goroutines
-		t.Run(tc.platform, func(t *testing.T) {
+		t.Run(tc.platform+"/"+tc.app, func(t *testing.T) {
 			t.Parallel()
-			t.Run(tc.app, func(t *testing.T) {
-				t.Parallel()
 
-				if tc.skipReason != "" {
-					t.Skip(tc.skipReason)
+			if tc.skipReason != "" {
+				t.Skip(tc.skipReason)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), gce.SuggestedTimeout)
+			defer cancel()
+
+			var err error
+			for attempt := 1; attempt <= 4; attempt++ {
+				logger := gce.SetupLogger(t)
+				logger.ToMainLog().Println("Calling SetupVM(). For details, see VM_initialization.txt.")
+				vm := gce.SetupVM(ctx, t, logger.ToFile("VM_initialization.txt"), gce.VMOptions{Platform: tc.platform, MachineType: agents.RecommendedMachineType(tc.platform)})
+				logger.ToMainLog().Printf("VM is ready: %#v", vm)
+
+				var retryable bool
+				retryable, err = runSingleTest(ctx, logger, vm, agentType, tc.app)
+				log.Printf("Attempt %v of %s test of %s finished with err=%v, retryable=%v", attempt, tc.platform, tc.app, err, retryable)
+				if err == nil {
+					return
 				}
-
-				ctx, cancel := context.WithTimeout(context.Background(), gce.SuggestedTimeout)
-				defer cancel()
-
-				var err error
-				for attempt := 1; attempt <= 4; attempt++ {
-					logger := gce.SetupLogger(t)
-					logger.ToMainLog().Println("Calling SetupVM(). For details, see VM_initialization.txt.")
-					vm := gce.SetupVM(ctx, t, logger.ToFile("VM_initialization.txt"), gce.VMOptions{Platform: tc.platform, MachineType: agents.RecommendedMachineType(tc.platform)})
-					logger.ToMainLog().Printf("VM is ready: %#v", vm)
-
-					var retryable bool
-					retryable, err = runSingleTest(ctx, logger, vm, agentType, tc.app)
-					log.Printf("Attempt %v of %s test of %s finished with err=%v, retryable=%v", attempt, tc.platform, tc.app, err, retryable)
-					if err == nil {
-						return
-					}
-					agents.RunOpsAgentDiagnostics(ctx, logger, vm)
-					if !retryable {
-						t.Fatalf("Non-retryable error: %v", err)
-					}
-					// If we got here, we're going to retry runSingleTest(). The VM we spawned
-					// won't be deleted until the end of t.Run(), (SetupVM() registers it for cleanup
-					// at the end of t.Run()), so to avoid accumulating too many idle VMs while we
-					// do our retries, we preemptively delete the VM now.
-					if deleteErr := gce.DeleteInstance(logger.ToMainLog(), vm); deleteErr != nil {
-						t.Errorf("Deleting VM %v failed: %v", vm.Name, deleteErr)
-					}
+				agents.RunOpsAgentDiagnostics(ctx, logger, vm)
+				if !retryable {
+					t.Fatalf("Non-retryable error: %v", err)
 				}
-				t.Errorf("Final attempt failed: %v", err)
-			})
+				// If we got here, we're going to retry runSingleTest(). The VM we spawned
+				// won't be deleted until the end of t.Run(), (SetupVM() registers it for cleanup
+				// at the end of t.Run()), so to avoid accumulating too many idle VMs while we
+				// do our retries, we preemptively delete the VM now.
+				if deleteErr := gce.DeleteInstance(logger.ToMainLog(), vm); deleteErr != nil {
+					t.Errorf("Deleting VM %v failed: %v", vm.Name, deleteErr)
+				}
+			}
+			t.Errorf("Final attempt failed: %v", err)
 		})
 	}
 }
